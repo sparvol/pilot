@@ -1,0 +1,58 @@
+# Signs a Pilot build with Adobe's ZXPSignCmd.
+#
+# Adobe's signer only exists as an Intel Mac or Windows program. The build Mac
+# is Apple Silicon without Rosetta, so package.sh uploads the unsigned bundle to
+# a draft release and runs this; it signs on GitHub's Mac (keeping the Mac
+# launcher's executable bit, which a Windows zip would drop) and attaches
+# Pilot.zxp back to the same draft.
+name: sign
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release holding PilotExtension-unsigned.zip
+        required: true
+permissions:
+  contents: write
+jobs:
+  sign:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Rosetta, for Adobe's Intel-only signer
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Adobe's signer, checked against a known copy
+        run: |
+          curl -fsSL -o ZXPSignCmd https://raw.githubusercontent.com/Adobe-CEP/CEP-Resources/master/ZXPSignCMD/4.1.3/macOS/ZXPSignCmd
+          echo "bc773fae0b97416fc7a462e7dadcc00270428a9913480c9b78b5606ff1cfb095  ZXPSignCmd" | shasum -a 256 -c -
+          chmod +x ZXPSignCmd
+
+      - name: Unsigned bundle
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern PilotExtension-unsigned.zip
+          mkdir ext && ditto -x -k PilotExtension-unsigned.zip ext
+          test -f ext/PilotExtension/CSXS/manifest.xml
+          test -x ext/PilotExtension/launcher/Pilot.app/Contents/MacOS/Pilot
+
+      - name: Sign and verify
+        env:
+          P12: ${{ secrets.PILOT_CERT_P12 }}
+          PASS: ${{ secrets.PILOT_CERT_PASSWORD }}
+        run: |
+          printf '%s' "$P12" | base64 -d > cert.p12
+          ./ZXPSignCmd -sign ext/PilotExtension Pilot.zxp cert.p12 "$PASS"
+          rm -f cert.p12
+          ./ZXPSignCmd -verify Pilot.zxp
+          unzip -l Pilot.zxp | grep -q "META-INF/signatures.xml"
+          shasum -a 256 Pilot.zxp
+
+      - name: Attach to the draft
+        run: gh release upload "$TAG" Pilot.zxp --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Never leave the certificate behind
+        if: always()
+        run: rm -f cert.p12
